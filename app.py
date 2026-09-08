@@ -38,99 +38,79 @@ def count_google_domain_matches(
     max_results=20,
 ):
     """
-    Cerca un valore tramite Google Custom Search API e conta
+    Cerca un valore tramite Serper/Google e conta
     quanti dei primi risultati appartengono al dominio indicato.
 
-    La funzione è dormiente: non viene chiamata automaticamente
-    da nessuna parte nell'app.
-
-    Richiede due variabili d'ambiente:
-        GOOGLE_API_KEY
-        GOOGLE_CSE_ID
-
-    Ritorna:
-        int: numero di risultati appartenenti al target_domain.
+    La funzione resta dormiente finché non viene chiamata.
     """
 
     if not value:
         return 0
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-    cse_id = os.getenv("GOOGLE_CSE_ID")
-
-    if not api_key or not cse_id:
+    if "SERPER_API_KEY" not in st.secrets:
         raise RuntimeError(
-            "Mancano GOOGLE_API_KEY o GOOGLE_CSE_ID."
+            "SERPER_API_KEY non configurata nei Secrets di Streamlit."
         )
 
-    max_results = min(int(max_results), 20)
+    api_key = st.secrets["SERPER_API_KEY"]
 
-    search_url = "https://www.googleapis.com/customsearch/v1"
+    search_url = "https://google.serper.dev/search"
+
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "q": str(value),
+        "num": min(int(max_results), 20),
+        "gl": "it",
+        "hl": "it",
+    }
+
+    response = requests.post(
+        search_url,
+        headers=headers,
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    organic_results = data.get(
+        "organic",
+        []
+    )
 
     matches = 0
-    collected = 0
-    start = 1
 
-    while collected < max_results:
+    for result in organic_results:
 
-        # Google Custom Search restituisce massimo 10 risultati
-        # per singola richiesta.
-        num = min(10, max_results - collected)
-
-        params = {
-            "key": api_key,
-            "cx": cse_id,
-            "q": str(value),
-            "start": start,
-            "num": num,
-        }
-
-        response = requests.get(
-            search_url,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
+        link = result.get(
+            "link",
+            ""
         )
 
-        response.raise_for_status()
+        try:
+            hostname = (
+                urlparse(link).hostname
+                or ""
+            ).lower()
 
-        data = response.json()
+        except Exception:
+            hostname = ""
 
-        items = data.get("items", [])
-
-        if not items:
-            break
-
-        for item in items:
-
-            link = item.get("link", "")
-
-            try:
-                hostname = (
-                    urlparse(link)
-                    .hostname
-                    or ""
-                ).lower()
-
-            except Exception:
-                hostname = ""
-
-            if (
-                hostname == target_domain
-                or hostname.endswith(
-                    "." + target_domain
-                )
-            ):
-                matches += 1
-
-        collected += len(items)
-
-        if len(items) < num:
-            break
-
-        start += len(items)
+        if (
+            hostname == target_domain
+            or hostname.endswith(
+                "." + target_domain
+            )
+        ):
+            matches += 1
 
     return matches
-
 
 def normalize_phone(value):
     if not value:
