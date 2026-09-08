@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from urllib.parse import urljoin, urlparse
@@ -30,6 +31,105 @@ def clean_text(value):
     if not value:
         return ""
     return re.sub(r"\s+", " ", value).strip()
+
+def count_google_domain_matches(
+    value,
+    target_domain="community.punterforum.com",
+    max_results=20,
+):
+    """
+    Cerca un valore tramite Google Custom Search API e conta
+    quanti dei primi risultati appartengono al dominio indicato.
+
+    La funzione è dormiente: non viene chiamata automaticamente
+    da nessuna parte nell'app.
+
+    Richiede due variabili d'ambiente:
+        GOOGLE_API_KEY
+        GOOGLE_CSE_ID
+
+    Ritorna:
+        int: numero di risultati appartenenti al target_domain.
+    """
+
+    if not value:
+        return 0
+
+    api_key = os.getenv("GOOGLE_API_KEY")
+    cse_id = os.getenv("GOOGLE_CSE_ID")
+
+    if not api_key or not cse_id:
+        raise RuntimeError(
+            "Mancano GOOGLE_API_KEY o GOOGLE_CSE_ID."
+        )
+
+    max_results = min(int(max_results), 20)
+
+    search_url = "https://www.googleapis.com/customsearch/v1"
+
+    matches = 0
+    collected = 0
+    start = 1
+
+    while collected < max_results:
+
+        # Google Custom Search restituisce massimo 10 risultati
+        # per singola richiesta.
+        num = min(10, max_results - collected)
+
+        params = {
+            "key": api_key,
+            "cx": cse_id,
+            "q": str(value),
+            "start": start,
+            "num": num,
+        }
+
+        response = requests.get(
+            search_url,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        items = data.get("items", [])
+
+        if not items:
+            break
+
+        for item in items:
+
+            link = item.get("link", "")
+
+            try:
+                hostname = (
+                    urlparse(link)
+                    .hostname
+                    or ""
+                ).lower()
+
+            except Exception:
+                hostname = ""
+
+            if (
+                hostname == target_domain
+                or hostname.endswith(
+                    "." + target_domain
+                )
+            ):
+                matches += 1
+
+        collected += len(items)
+
+        if len(items) < num:
+            break
+
+        start += len(items)
+
+    return matches
 
 
 def normalize_phone(value):
