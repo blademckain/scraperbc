@@ -8,7 +8,12 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-BASE_URL = "https://forli.bakecaincontrii.com/donna-cerca-uomo/"
+SOURCES = {
+    "Forlì": "https://forli.bakecaincontrii.com/donna-cerca-uomo/",
+    "Rimini": "https://rimini.bakecaincontrii.com/donna-cerca-uomo/",
+    "Ravenna": "https://ravenna.bakecaincontrii.com/donna-cerca-uomo/",
+}
+
 REQUEST_TIMEOUT = 20
 
 HEADERS = {
@@ -27,34 +32,144 @@ def clean_text(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
-def parse_age(text):
-    match = re.search(r"\b(\d{2})\s*anni\b", text or "", flags=re.I)
-    return int(match.group(1)) if match else None
-
-
-def parse_location(text):
-    """
-    Esempi osservati:
-      '25 anni Forlì / Cesenatico'
-      '21 anni Forlì'
-      '33 anni Forlì / CESENA Russa'
-    """
-    if not text:
+def normalize_phone(value):
+    if not value:
         return ""
 
-    text = clean_text(text)
-    text = re.sub(r"^\s*\d{2}\s*anni\s*", "", text, flags=re.I)
-    return text.strip(" -/")
+    value = value.replace("tel:", "").strip()
+
+    has_plus = value.startswith("+")
+    digits = re.sub(r"\D", "", value)
+
+    if not digits:
+        return ""
+
+    normalized = ("+" if has_plus else "") + digits
+
+    if len(digits) < 8 or len(digits) > 13:
+        return ""
+
+    return normalized
+
+
+def extract_phone_from_detail(html):
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = []
+
+    # 1. Cerca link del tipo tel:3331234567
+    for a in soup.select('a[href^="tel:"]'):
+        candidates.append(a.get("href", ""))
+
+    # 2. Cerca il telefono negli attributi HTML
+    phone_attr_names = (
+        "data-phone",
+        "data-telephone",
+        "data-tel",
+        "data-number",
+        "data-phone-number",
+        "phone",
+        "telephone",
+    )
+
+    for tag in soup.find_all(True):
+        for attr_name in phone_attr_names:
+            if tag.has_attr(attr_name):
+                candidates.append(str(tag.get(attr_name)))
+
+    # 3. Cerca nel titolo della pagina
+    if soup.title:
+        candidates.append(
+            soup.title.get_text(" ", strip=True)
+        )
+
+    # 4. Cerca nei meta tag
+    for meta in soup.find_all("meta"):
+        content = meta.get("content")
+        if content:
+            candidates.append(content)
+
+    # 5. Cerca negli script / JSON incorporati
+    for script in soup.find_all("script"):
+        script_text = (
+            script.string
+            or script.get_text(" ", strip=True)
+        )
+
+        if script_text:
+            candidates.append(script_text)
+
+    # 6. Cerca nel testo visibile
+    candidates.append(
+        soup.get_text(" ", strip=True)
+    )
+
+    # Cellulari italiani
+    mobile_pattern = re.compile(
+        r"(?<!\d)(?:\+?39[\s.\-]*)?"
+        r"(3(?:[\s.\-]*\d){8,9})(?!\d)"
+    )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        match = mobile_pattern.search(candidate)
+
+        if match:
+            phone = normalize_phone(match.group(0))
+
+            if phone:
+                return phone
+
+    # Ricerca generica come fallback
+    generic_pattern = re.compile(
+        r"(?<!\d)(\+?\d(?:[\s.\-]*\d){7,12})(?!\d)"
+    )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        for match in generic_pattern.finditer(candidate):
+
+            phone = normalize_phone(
+                match.group(1)
+            )
+
+            if phone:
+                digits = re.sub(
+                    r"\D",
+                    "",
+                    phone
+                )
+
+                if (
+                    digits.startswith("20")
+                    and len(digits) == 8
+                ):
+                    continue
+
+                return phone
+
+    return ""
 
 
 def looks_like_ad_url(href):
     if not href:
         return False
 
-    absolute = urljoin(BASE_URL, href)
-    parsed = urlparse(absolute)
+    absolute = urljoin(
+        "https://www.bakecaincontrii.com/",
+        href
+    )
 
-    # Esclude navigazione, categorie e pagine di servizio.
+    parsed = urlparse(absolute)
+    path = parsed.path.lower()
+
+    # Gli annunci hanno normalmente /annuncio/
+    if "/annuncio/" in path:
+        return True
+
     blocked_parts = (
         "/donna-cerca-uomo/",
         "/uomo-cerca-uomo/",
@@ -68,364 +183,376 @@ def looks_like_ad_url(href):
         "/assistenza",
     )
 
-    path = parsed.path.lower()
-
-    if any(part in path for part in blocked_parts):
-        return False
-
-    # Gli annunci sono link interni con uno slug abbastanza lungo.
     return (
-        parsed.netloc.endswith("bakecaincontrii.com")
+        parsed.netloc.endswith(
+            "bakecaincontrii.com"
+        )
+        and not any(
+            part in path
+            for part in blocked_parts
+        )
         and len(path.strip("/")) > 20
     )
 
 
-def extract_from_card(card, page_url):
-    text = clean_text(card.get_text(" ", strip=True))
-    if not text or "anni" not in text.lower():
-        return None
+def extract_listing_links(html, page_url):
 
-    links = [
-        a for a in card.find_all("a", href=True)
-        if looks_like_ad_url(a.get("href"))
-    ]
-    if not links:
-        return None
-
-    link_el = max(
-        links,
-        key=lambda a: len(clean_text(a.get_text(" ", strip=True)))
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
     )
 
-    title = clean_text(link_el.get_text(" ", strip=True))
-    url = urljoin(page_url, link_el.get("href"))
-
-    if len(title) < 8:
-        img = link_el.find("img", alt=True) or card.find("img", alt=True)
-        if img:
-            title = clean_text(img.get("alt"))
-
-    age = parse_age(text)
-
-    # Cerca un piccolo blocco testuale che contiene "anni", tipicamente metadati.
-    meta_text = ""
-    for node in card.find_all(["div", "span", "p", "li"]):
-        candidate = clean_text(node.get_text(" ", strip=True))
-        if re.search(r"\b\d{2}\s*anni\b", candidate, flags=re.I):
-            if not meta_text or len(candidate) < len(meta_text):
-                meta_text = candidate
-
-    location = parse_location(meta_text) if meta_text else ""
-
-    # Descrizione: seleziona il testo più lungo che non coincida col titolo/metadati.
-    candidates = []
-    for node in card.find_all(["p", "div"]):
-        candidate = clean_text(node.get_text(" ", strip=True))
-        if (
-            len(candidate) >= 40
-            and candidate != title
-            and "anni" not in candidate.lower()
-        ):
-            candidates.append(candidate)
-
-    description = max(candidates, key=len) if candidates else ""
-    if description == text:
-        description = ""
-
-    return {
-        "titolo": title,
-        "eta": age,
-        "localita": location,
-        "descrizione": description,
-        "url": url,
-    }
-
-
-def extract_ads(html, page_url):
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Primo tentativo: classi/elementi che normalmente rappresentano card.
-    selectors = [
-        "article",
-        "[class*='card']",
-        "[class*='listing']",
-        "[class*='advert']",
-        "[class*='annunc']",
-        "[class*='result']",
-    ]
-
-    candidate_cards = []
-    seen_nodes = set()
-
-    for selector in selectors:
-        for node in soup.select(selector):
-            node_id = id(node)
-            if node_id not in seen_nodes:
-                seen_nodes.add(node_id)
-                candidate_cards.append(node)
-
-    ads = []
+    results = []
     seen_urls = set()
 
-    for card in candidate_cards:
-        item = extract_from_card(card, page_url)
-        if item and item["url"] not in seen_urls:
-            seen_urls.add(item["url"])
-            ads.append(item)
+    for a in soup.find_all(
+        "a",
+        href=True
+    ):
 
-    # Fallback: risale dall'anchor al contenitore che include età + descrizione.
-    if len(ads) < 3:
-        for a in soup.find_all("a", href=True):
-            href = a.get("href")
-            if not looks_like_ad_url(href):
-                continue
+        href = a.get("href")
 
-            container = a
-            selected = None
+        if not looks_like_ad_url(href):
+            continue
 
-            for _ in range(6):
-                container = container.parent
-                if not container:
-                    break
-                txt = clean_text(container.get_text(" ", strip=True))
-                if re.search(r"\b\d{2}\s*anni\b", txt, flags=re.I):
-                    selected = container
-                    break
+        url = urljoin(
+            page_url,
+            href
+        )
 
-            if selected:
-                item = extract_from_card(selected, page_url)
-                if item and item["url"] not in seen_urls:
-                    seen_urls.add(item["url"])
-                    ads.append(item)
+        if url in seen_urls:
+            continue
 
-    return ads
-
-
-def find_next_page(html, current_url):
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Cerca rel="next".
-    nxt = soup.find("a", attrs={"rel": lambda x: x and "next" in x})
-    if nxt and nxt.get("href"):
-        return urljoin(current_url, nxt["href"])
-
-    # Fallback su etichette italiane.
-    for a in soup.find_all("a", href=True):
-        label = clean_text(a.get_text(" ", strip=True)).lower()
-        aria = clean_text(a.get("aria-label", "")).lower()
-        if label in {"seguente", "prossima", "next", "›", "»"} or any(
-            word in aria for word in ("seguente", "prossima", "next")
-        ):
-            return urljoin(current_url, a["href"])
-
-    return None
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def scrape_ads(start_url, max_pages=1):
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    all_ads = []
-    seen_urls = set()
-    current_url = start_url
-
-    for page_num in range(1, max_pages + 1):
-        response = session.get(current_url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-
-        page_ads = extract_ads(response.text, current_url)
-
-        for ad in page_ads:
-            if ad["url"] not in seen_urls:
-                seen_urls.add(ad["url"])
-                all_ads.append(ad)
-
-        next_url = find_next_page(response.text, current_url)
-        if not next_url or next_url == current_url:
-            break
-
-        current_url = next_url
-
-        # Piccola pausa per non martellare il sito.
-        if page_num < max_pages:
-            time.sleep(0.8)
-
-    return all_ads
-
-
-def apply_filters(df, age_range, locations, keyword):
-    filtered = df.copy()
-
-    if not filtered.empty and filtered["eta"].notna().any():
-        filtered = filtered[
-            filtered["eta"].isna()
-            | filtered["eta"].between(age_range[0], age_range[1])
-        ]
-
-    if locations:
-        pattern = "|".join(re.escape(x) for x in locations)
-        filtered = filtered[
-            filtered["localita"].fillna("").str.contains(
-                pattern, case=False, regex=True
-            )
-        ]
-
-    if keyword:
-        needle = keyword.strip()
-        mask = (
-            filtered["titolo"].fillna("").str.contains(
-                needle, case=False, regex=False
-            )
-            | filtered["descrizione"].fillna("").str.contains(
-                needle, case=False, regex=False
-            )
-            | filtered["localita"].fillna("").str.contains(
-                needle, case=False, regex=False
+        title = clean_text(
+            a.get_text(
+                " ",
+                strip=True
             )
         )
-        filtered = filtered[mask]
 
-    return filtered
+        # Cerca ALT immagine
+        if len(title) < 5:
 
+            img = a.find(
+                "img",
+                alt=True
+            )
+
+            if img:
+                title = clean_text(
+                    img.get("alt")
+                )
+
+        # Cerca titolo vicino
+        if len(title) < 5:
+
+            parent = a.parent
+
+            if parent:
+
+                heading = parent.find(
+                    [
+                        "h1",
+                        "h2",
+                        "h3",
+                        "h4"
+                    ]
+                )
+
+                if heading:
+                    title = clean_text(
+                        heading.get_text(
+                            " ",
+                            strip=True
+                        )
+                    )
+
+        if len(title) < 5:
+            continue
+
+        seen_urls.add(url)
+
+        results.append(
+            {
+                "nome_annuncio": title,
+                "link": url,
+            }
+        )
+
+    return results
+
+
+def get_page(session, url):
+
+    response = session.get(
+        url,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    return response.text
+
+
+@st.cache_data(
+    ttl=900,
+    show_spinner=False
+)
+def scrape_all_sources():
+
+    session = requests.Session()
+
+    session.headers.update(
+        HEADERS
+    )
+
+    rows = []
+
+    for city, source_url in SOURCES.items():
+
+        listing_html = get_page(
+            session,
+            source_url
+        )
+
+        listings = extract_listing_links(
+            listing_html,
+            source_url
+        )
+
+        for item in listings:
+
+            phone = ""
+
+            try:
+
+                detail_html = get_page(
+                    session,
+                    item["link"]
+                )
+
+                phone = (
+                    extract_phone_from_detail(
+                        detail_html
+                    )
+                )
+
+            except requests.RequestException:
+
+                phone = ""
+
+            rows.append(
+                {
+                    "Annuncio":
+                        item["nome_annuncio"],
+
+                    "Città":
+                        city,
+
+                    "Telefono":
+                        phone
+                        if phone
+                        else "Non trovato",
+
+                    "Link":
+                        item["link"],
+                }
+            )
+
+            # Piccola pausa tra gli annunci
+            time.sleep(0.25)
+
+    # Elimina duplicati
+    unique_rows = []
+    seen = set()
+
+    for row in rows:
+
+        key = (
+            row["Link"],
+            row["Città"]
+        )
+
+        if key not in seen:
+
+            seen.add(key)
+
+            unique_rows.append(row)
+
+    return unique_rows
+
+
+# =========================
+# INTERFACCIA STREAMLIT
+# =========================
 
 st.set_page_config(
-    page_title="Scraper annunci Forlì",
+    page_title="Scraper annunci Romagna",
     page_icon="🔎",
     layout="wide",
 )
 
-st.title("🔎 Scraper annunci — Forlì")
-st.caption(
-    "Estrae dati pubblicamente visibili dalla pagina indicata e consente "
-    "di filtrarli. Verifica sempre Termini di Servizio e robots.txt del sito."
+st.title(
+    "🔎 Annunci Forlì, Rimini e Ravenna"
 )
 
-with st.sidebar:
-    st.header("Impostazioni")
+st.caption(
+    "Elenco degli annunci pubblicamente "
+    "visibili trovati nelle tre città."
+)
 
-    url = st.text_input("Pagina da analizzare", value=BASE_URL)
 
-    max_pages = st.number_input(
-        "Numero massimo di pagine",
-        min_value=1,
-        max_value=20,
-        value=1,
-        step=1,
-        help="Per prudenza il valore predefinito è 1.",
-    )
-
-    refresh = st.button("Aggiorna scraping", type="primary", use_container_width=True)
+refresh = st.button(
+    "🔄 Aggiorna dati",
+    type="primary"
+)
 
 if refresh:
-    scrape_ads.clear()
+    scrape_all_sources.clear()
+
 
 try:
-    with st.spinner("Lettura della pagina in corso..."):
-        records = scrape_ads(url, int(max_pages))
+
+    with st.spinner(
+        "Sto leggendo gli annunci "
+        "e cercando i numeri di telefono..."
+    ):
+
+        records = scrape_all_sources()
+
 
 except requests.HTTPError as exc:
-    st.error(f"Errore HTTP durante lo scraping: {exc}")
+
+    st.error(
+        f"Errore HTTP: {exc}"
+    )
+
     st.stop()
+
 
 except requests.RequestException as exc:
-    st.error(f"Impossibile collegarsi al sito: {exc}")
+
+    st.error(
+        f"Errore di connessione: {exc}"
+    )
+
     st.stop()
 
+
 except Exception as exc:
-    st.error(f"Errore inatteso: {exc}")
+
+    st.error(
+        f"Errore inatteso: {exc}"
+    )
+
+    st.stop()
+
+
+if not records:
+
+    st.warning(
+        "Non è stato trovato "
+        "alcun annuncio."
+    )
+
     st.stop()
 
 
 df = pd.DataFrame(records)
 
-if df.empty:
-    st.warning(
-        "Nessun annuncio riconosciuto. Il sito potrebbe aver cambiato struttura "
-        "HTML oppure potrebbe bloccare le richieste provenienti dal server Streamlit."
-    )
-    st.stop()
 
-df["eta"] = pd.to_numeric(df["eta"], errors="coerce")
+# =========================
+# CONTATORI
+# =========================
 
-# -------------------------
-# Filtri
-# -------------------------
-st.subheader("Filtri")
-
-col1, col2, col3 = st.columns([1, 1.4, 1.5])
-
-valid_ages = df["eta"].dropna()
-
-with col1:
-    if not valid_ages.empty:
-        age_min = int(valid_ages.min())
-        age_max = int(valid_ages.max())
-
-        if age_min == age_max:
-            age_range = (age_min, age_max)
-            st.info(f"Età disponibile: {age_min}")
-        else:
-            age_range = st.slider(
-                "Età",
-                min_value=age_min,
-                max_value=age_max,
-                value=(age_min, age_max),
-            )
-    else:
-        age_range = (18, 99)
-        st.info("Età non disponibile nei dati estratti.")
-
-with col2:
-    location_options = sorted(
-        x for x in df["localita"].dropna().astype(str).unique()
-        if x.strip()
-    )
-    selected_locations = st.multiselect(
-        "Località / zona",
-        options=location_options,
-    )
-
-with col3:
-    keyword = st.text_input(
-        "Cerca nel titolo, descrizione o località",
-        placeholder="es. Cesena, nuova, centro...",
-    )
-
-filtered = apply_filters(
-    df,
-    age_range=age_range,
-    locations=selected_locations,
-    keyword=keyword,
+city_counts = (
+    df.groupby("Città")
+    .size()
+    .to_dict()
 )
 
-st.write(f"**{len(filtered)} risultati** su {len(df)} annunci estratti")
 
-# Vista a schede, senza immagini.
-for _, row in filtered.iterrows():
-    with st.container(border=True):
-        title = row.get("titolo") or "Annuncio"
-        st.markdown(f"### {title}")
+st.write(
+    f"**{len(df)} annunci trovati**"
+)
 
-        meta = []
-        if pd.notna(row.get("eta")):
-            meta.append(f"{int(row['eta'])} anni")
-        if row.get("localita"):
-            meta.append(str(row["localita"]))
+st.write(
+    f"Forlì: "
+    f"**{city_counts.get('Forlì', 0)}**"
+    f" — Rimini: "
+    f"**{city_counts.get('Rimini', 0)}**"
+    f" — Ravenna: "
+    f"**{city_counts.get('Ravenna', 0)}**"
+)
 
-        if meta:
-            st.caption(" · ".join(meta))
 
-        if row.get("descrizione"):
-            st.write(row["descrizione"])
+# =========================
+# TABELLA
+# =========================
 
-        st.link_button("Apri annuncio", row["url"])
+display_df = df[
+    [
+        "Annuncio",
+        "Città",
+        "Telefono",
+        "Link"
+    ]
+].copy()
 
-# Download CSV dei soli risultati filtrati.
-csv_data = filtered.to_csv(index=False).encode("utf-8-sig")
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True,
+
+    column_config={
+
+        "Annuncio":
+            st.column_config.TextColumn(
+                "Nome annuncio",
+                width="large"
+            ),
+
+        "Città":
+            st.column_config.TextColumn(
+                "Città",
+                width="small"
+            ),
+
+        "Telefono":
+            st.column_config.TextColumn(
+                "Telefono",
+                width="medium"
+            ),
+
+        "Link":
+            st.column_config.LinkColumn(
+                "Annuncio",
+                display_text="Apri",
+                width="small"
+            ),
+    },
+)
+
+
+# =========================
+# DOWNLOAD CSV
+# =========================
+
+csv_data = (
+    df.to_csv(
+        index=False
+    )
+    .encode("utf-8-sig")
+)
+
+
 st.download_button(
-    "Scarica risultati filtrati in CSV",
+    "📥 Scarica elenco CSV",
     data=csv_data,
-    file_name="annunci_forli_filtrati.csv",
+    file_name=(
+        "annunci_forli_"
+        "rimini_ravenna.csv"
+    ),
     mime="text/csv",
 )
