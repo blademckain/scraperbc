@@ -1,19 +1,26 @@
-import os
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from supabase import create_client
 
+
+# ============================================================
+# CONFIGURAZIONE
+# ============================================================
 
 SOURCES = {
     "Forlì": "https://forli.bakecaincontrii.com/donna-cerca-uomo/",
     "Rimini": "https://rimini.bakecaincontrii.com/donna-cerca-uomo/",
     "Ravenna": "https://ravenna.bakecaincontrii.com/donna-cerca-uomo/",
 }
+
+TABLE_NAME = "annunci"
 
 REQUEST_TIMEOUT = 20
 
@@ -27,121 +34,84 @@ HEADERS = {
 }
 
 
+# ============================================================
+# FUNZIONI GENERALI
+# ============================================================
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def clean_text(value):
     if not value:
         return ""
-    return re.sub(r"\s+", " ", value).strip()
 
-def count_google_domain_matches(
-    value,
-    target_domain="community.punterforum.com",
-    max_results=20,
-):
-    """
-    Cerca un valore tramite Serper/Google e conta
-    quanti dei primi risultati appartengono al dominio indicato.
+    return re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip()
 
-    La funzione resta dormiente finché non viene chiamata.
-    """
 
-    if not value:
-        return 0
-
-    if "SERPER_API_KEY" not in st.secrets:
-        raise RuntimeError(
-            "SERPER_API_KEY non configurata nei Secrets di Streamlit."
-        )
-
-    api_key = st.secrets["SERPER_API_KEY"]
-
-    search_url = "https://google.serper.dev/search"
-
-    headers = {
-        "X-API-KEY": api_key,
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "q": str(value),
-        "num": min(int(max_results), 20),
-        "gl": "it",
-        "hl": "it",
-    }
-
-    response = requests.post(
-        search_url,
-        headers=headers,
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    organic_results = data.get(
-        "organic",
-        []
-    )
-
-    matches = 0
-
-    for result in organic_results:
-
-        link = result.get(
-            "link",
-            ""
-        )
-
-        try:
-            hostname = (
-                urlparse(link).hostname
-                or ""
-            ).lower()
-
-        except Exception:
-            hostname = ""
-
-        if (
-            hostname == target_domain
-            or hostname.endswith(
-                "." + target_domain
-            )
-        ):
-            matches += 1
-
-    return matches
+# ============================================================
+# TELEFONO
+# ============================================================
 
 def normalize_phone(value):
+
     if not value:
         return ""
 
-    value = value.replace("tel:", "").strip()
+    value = value.replace(
+        "tel:",
+        ""
+    ).strip()
 
     has_plus = value.startswith("+")
-    digits = re.sub(r"\D", "", value)
 
-    if not digits:
+    digits = re.sub(
+        r"\D",
+        "",
+        value
+    )
+
+    if len(digits) < 8:
         return ""
 
-    normalized = ("+" if has_plus else "") + digits
-
-    if len(digits) < 8 or len(digits) > 13:
+    if len(digits) > 13:
         return ""
 
-    return normalized
+    return (
+        ("+" if has_plus else "")
+        + digits
+    )
 
 
 def extract_phone_from_detail(html):
-    soup = BeautifulSoup(html, "html.parser")
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
+
     candidates = []
 
-    # 1. Cerca link del tipo tel:3331234567
-    for a in soup.select('a[href^="tel:"]'):
-        candidates.append(a.get("href", ""))
+    # -----------------------------------------
+    # 1. Link tel:
+    # -----------------------------------------
 
-    # 2. Cerca il telefono negli attributi HTML
-    phone_attr_names = (
+    for a in soup.select(
+        'a[href^="tel:"]'
+    ):
+        candidates.append(
+            a.get("href", "")
+        )
+
+    # -----------------------------------------
+    # 2. Attributi HTML
+    # -----------------------------------------
+
+    phone_attrs = (
         "data-phone",
         "data-telephone",
         "data-tel",
@@ -152,89 +122,111 @@ def extract_phone_from_detail(html):
     )
 
     for tag in soup.find_all(True):
-        for attr_name in phone_attr_names:
-            if tag.has_attr(attr_name):
-                candidates.append(str(tag.get(attr_name)))
 
-    # 3. Cerca nel titolo della pagina
+        for attr in phone_attrs:
+
+            if tag.has_attr(attr):
+
+                candidates.append(
+                    str(tag.get(attr))
+                )
+
+    # -----------------------------------------
+    # 3. Titolo pagina
+    # -----------------------------------------
+
     if soup.title:
+
         candidates.append(
-            soup.title.get_text(" ", strip=True)
+            soup.title.get_text(
+                " ",
+                strip=True
+            )
         )
 
-    # 4. Cerca nei meta tag
+    # -----------------------------------------
+    # 4. Meta tag
+    # -----------------------------------------
+
     for meta in soup.find_all("meta"):
-        content = meta.get("content")
-        if content:
-            candidates.append(content)
 
-    # 5. Cerca negli script / JSON incorporati
+        content = meta.get("content")
+
+        if content:
+
+            candidates.append(
+                content
+            )
+
+    # -----------------------------------------
+    # 5. Script / JSON
+    # -----------------------------------------
+
     for script in soup.find_all("script"):
-        script_text = (
+
+        text = (
             script.string
-            or script.get_text(" ", strip=True)
+            or script.get_text(
+                " ",
+                strip=True
+            )
         )
 
-        if script_text:
-            candidates.append(script_text)
+        if text:
 
-    # 6. Cerca nel testo visibile
+            candidates.append(
+                text
+            )
+
+    # -----------------------------------------
+    # 6. Testo visibile
+    # -----------------------------------------
+
     candidates.append(
-        soup.get_text(" ", strip=True)
+        soup.get_text(
+            " ",
+            strip=True
+        )
     )
 
-    # Cellulari italiani
+    # -----------------------------------------
+    # Cerca cellulari italiani
+    # -----------------------------------------
+
     mobile_pattern = re.compile(
-        r"(?<!\d)(?:\+?39[\s.\-]*)?"
-        r"(3(?:[\s.\-]*\d){8,9})(?!\d)"
+        r"(?<!\d)"
+        r"(?:\+?39[\s.\-]*)?"
+        r"(3(?:[\s.\-]*\d){8,9})"
+        r"(?!\d)"
     )
 
     for candidate in candidates:
+
         if not candidate:
             continue
 
-        match = mobile_pattern.search(candidate)
+        match = mobile_pattern.search(
+            candidate
+        )
 
         if match:
-            phone = normalize_phone(match.group(0))
-
-            if phone:
-                return phone
-
-    # Ricerca generica come fallback
-    generic_pattern = re.compile(
-        r"(?<!\d)(\+?\d(?:[\s.\-]*\d){7,12})(?!\d)"
-    )
-
-    for candidate in candidates:
-        if not candidate:
-            continue
-
-        for match in generic_pattern.finditer(candidate):
 
             phone = normalize_phone(
-                match.group(1)
+                match.group(0)
             )
 
             if phone:
-                digits = re.sub(
-                    r"\D",
-                    "",
-                    phone
-                )
-
-                if (
-                    digits.startswith("20")
-                    and len(digits) == 8
-                ):
-                    continue
-
                 return phone
 
     return ""
 
 
+# ============================================================
+# RICONOSCIMENTO LINK ANNUNCI
+# ============================================================
+
 def looks_like_ad_url(href):
+
     if not href:
         return False
 
@@ -243,10 +235,13 @@ def looks_like_ad_url(href):
         href
     )
 
-    parsed = urlparse(absolute)
+    parsed = urlparse(
+        absolute
+    )
+
     path = parsed.path.lower()
 
-    # Gli annunci hanno normalmente /annuncio/
+    # Normalmente gli annunci hanno /annuncio/
     if "/annuncio/" in path:
         return True
 
@@ -271,11 +266,20 @@ def looks_like_ad_url(href):
             part in path
             for part in blocked_parts
         )
-        and len(path.strip("/")) > 20
+        and len(
+            path.strip("/")
+        ) > 20
     )
 
 
-def extract_listing_links(html, page_url):
+# ============================================================
+# ESTRAZIONE ANNUNCI DALLA PAGINA PRINCIPALE
+# ============================================================
+
+def extract_listing_links(
+    html,
+    page_url
+):
 
     soup = BeautifulSoup(
         html,
@@ -283,6 +287,7 @@ def extract_listing_links(html, page_url):
     )
 
     results = []
+
     seen_urls = set()
 
     for a in soup.find_all(
@@ -292,7 +297,9 @@ def extract_listing_links(html, page_url):
 
         href = a.get("href")
 
-        if not looks_like_ad_url(href):
+        if not looks_like_ad_url(
+            href
+        ):
             continue
 
         url = urljoin(
@@ -310,7 +317,10 @@ def extract_listing_links(html, page_url):
             )
         )
 
-        # Cerca ALT immagine
+        # -------------------------------------
+        # Se manca il titolo cerca ALT immagine
+        # -------------------------------------
+
         if len(title) < 5:
 
             img = a.find(
@@ -319,11 +329,15 @@ def extract_listing_links(html, page_url):
             )
 
             if img:
+
                 title = clean_text(
                     img.get("alt")
                 )
 
-        # Cerca titolo vicino
+        # -------------------------------------
+        # Cerca heading vicino
+        # -------------------------------------
+
         if len(title) < 5:
 
             parent = a.parent
@@ -340,6 +354,7 @@ def extract_listing_links(html, page_url):
                 )
 
                 if heading:
+
                     title = clean_text(
                         heading.get_text(
                             " ",
@@ -350,19 +365,28 @@ def extract_listing_links(html, page_url):
         if len(title) < 5:
             continue
 
-        seen_urls.add(url)
+        seen_urls.add(
+            url
+        )
 
         results.append(
             {
-                "nome_annuncio": title,
-                "link": url,
+                "titolo": title,
+                "url": url,
             }
         )
 
     return results
 
 
-def get_page(session, url):
+# ============================================================
+# DOWNLOAD PAGINE
+# ============================================================
+
+def get_page(
+    session,
+    url
+):
 
     response = session.get(
         url,
@@ -374,11 +398,171 @@ def get_page(session, url):
     return response.text
 
 
-@st.cache_data(
-    ttl=900,
-    show_spinner=False
-)
-def scrape_all_sources():
+# ============================================================
+# SUPABASE
+# ============================================================
+
+@st.cache_resource
+def get_supabase():
+
+    url = st.secrets[
+        "SUPABASE_URL"
+    ]
+
+    key = st.secrets[
+        "SUPABASE_KEY"
+    ]
+
+    return create_client(
+        url,
+        key
+    )
+
+
+def load_all_ads():
+
+    db = get_supabase()
+
+    response = (
+        db
+        .table(TABLE_NAME)
+        .select("*")
+        .order(
+            "first_seen",
+            desc=True
+        )
+        .execute()
+    )
+
+    return (
+        response.data
+        or []
+    )
+
+
+def load_known_urls():
+
+    db = get_supabase()
+
+    response = (
+        db
+        .table(TABLE_NAME)
+        .select("url")
+        .execute()
+    )
+
+    return {
+        row["url"]
+        for row in (
+            response.data
+            or []
+        )
+    }
+
+
+def insert_new_ad(row):
+
+    db = get_supabase()
+
+    (
+        db
+        .table(TABLE_NAME)
+        .insert(row)
+        .execute()
+    )
+
+
+def update_last_seen(
+    url,
+    seen_at
+):
+
+    db = get_supabase()
+
+    (
+        db
+        .table(TABLE_NAME)
+        .update(
+            {
+                "last_seen": seen_at,
+                "active": True,
+            }
+        )
+        .eq(
+            "url",
+            url
+        )
+        .execute()
+    )
+
+
+def mark_missing_as_inactive(
+    current_urls
+):
+
+    db = get_supabase()
+
+    existing = load_all_ads()
+
+    for row in existing:
+
+        url = row.get(
+            "url"
+        )
+
+        if (
+            url
+            and url not in current_urls
+            and row.get(
+                "active",
+                True
+            )
+        ):
+
+            (
+                db
+                .table(TABLE_NAME)
+                .update(
+                    {
+                        "active": False
+                    }
+                )
+                .eq(
+                    "url",
+                    url
+                )
+                .execute()
+            )
+
+
+def save_note(
+    row_id,
+    note
+):
+
+    db = get_supabase()
+
+    (
+        db
+        .table(TABLE_NAME)
+        .update(
+            {
+                "note": note or ""
+            }
+        )
+        .eq(
+            "id",
+            int(row_id)
+        )
+        .execute()
+    )
+
+
+# ============================================================
+# SCRAPING + SINCRONIZZAZIONE DATABASE
+# ============================================================
+
+def scrape_and_sync():
 
     session = requests.Session()
 
@@ -386,21 +570,87 @@ def scrape_all_sources():
         HEADERS
     )
 
-    rows = []
+    # URL già presenti nel database
+    known_urls = load_known_urls()
+
+    # URL trovati nello scraping corrente
+    current_urls = set()
+
+    new_count = 0
+    known_count = 0
+
+    errors = []
+
+    now = utc_now_iso()
+
+    # --------------------------------------------------------
+    # Analizza Forlì, Rimini e Ravenna
+    # --------------------------------------------------------
 
     for city, source_url in SOURCES.items():
 
-        listing_html = get_page(
-            session,
-            source_url
-        )
+        try:
 
-        listings = extract_listing_links(
-            listing_html,
-            source_url
-        )
+            listing_html = get_page(
+                session,
+                source_url
+            )
+
+            listings = (
+                extract_listing_links(
+                    listing_html,
+                    source_url
+                )
+            )
+
+        except requests.RequestException as exc:
+
+            errors.append(
+                f"{city}: {exc}"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Analizza gli annunci trovati
+        # ----------------------------------------------------
 
         for item in listings:
+
+            url = item["url"]
+
+            current_urls.add(
+                url
+            )
+
+            # =================================================
+            # ANNUNCIO GIÀ CONOSCIUTO
+            # =================================================
+
+            if url in known_urls:
+
+                known_count += 1
+
+                try:
+
+                    update_last_seen(
+                        url,
+                        now
+                    )
+
+                except Exception as exc:
+
+                    errors.append(
+                        f"Aggiornamento {url}: {exc}"
+                    )
+
+                # IMPORTANTE:
+                # non apre nuovamente il dettaglio
+                continue
+
+            # =================================================
+            # NUOVO ANNUNCIO
+            # =================================================
 
             phone = ""
 
@@ -408,7 +658,7 @@ def scrape_all_sources():
 
                 detail_html = get_page(
                     session,
-                    item["link"]
+                    url
                 )
 
                 phone = (
@@ -417,222 +667,658 @@ def scrape_all_sources():
                     )
                 )
 
-            except requests.RequestException:
+            except requests.RequestException as exc:
 
-                phone = ""
+                errors.append(
+                    f"Dettaglio {url}: {exc}"
+                )
 
-            rows.append(
-                {
-                    "Annuncio":
-                        item["nome_annuncio"],
+            # -------------------------------------------------
+            # Record da salvare
+            # -------------------------------------------------
 
-                    "Città":
-                        city,
+            row = {
 
-                    "Telefono":
-                        phone
-                        if phone
-                        else "Non trovato",
+                "url":
+                    url,
 
-                    "Link":
-                        item["link"],
-                }
+                "titolo":
+                    item["titolo"],
+
+                "citta":
+                    city,
+
+                "telefono":
+                    phone or "",
+
+                "first_seen":
+                    now,
+
+                "last_seen":
+                    now,
+
+                "active":
+                    True,
+
+                "note":
+                    "",
+
+                # ---------------------------------------------
+                # Campi predisposti per elaborazioni future
+                # ---------------------------------------------
+
+                "external_check_done":
+                    False,
+
+                "external_match_count":
+                    None,
+            }
+
+            # -------------------------------------------------
+            # Salvataggio Supabase
+            # -------------------------------------------------
+
+            try:
+
+                insert_new_ad(
+                    row
+                )
+
+                known_urls.add(
+                    url
+                )
+
+                new_count += 1
+
+            except Exception as exc:
+
+                errors.append(
+                    f"Salvataggio {url}: {exc}"
+                )
+
+            # Piccola pausa per non sovraccaricare il sito
+            time.sleep(
+                0.25
             )
 
-            # Piccola pausa tra gli annunci
-            time.sleep(0.25)
+    # --------------------------------------------------------
+    # Annunci non più presenti
+    # --------------------------------------------------------
 
-    # Elimina duplicati
-    unique_rows = []
-    seen = set()
+    if current_urls:
 
-    for row in rows:
+        try:
 
-        key = (
-            row["Link"],
-            row["Città"]
-        )
+            mark_missing_as_inactive(
+                current_urls
+            )
 
-        if key not in seen:
+        except Exception as exc:
 
-            seen.add(key)
+            errors.append(
+                "Aggiornamento stato annunci: "
+                f"{exc}"
+            )
 
-            unique_rows.append(row)
+    return {
 
-    return unique_rows
+        "new":
+            new_count,
+
+        "known":
+            known_count,
+
+        "current":
+            len(current_urls),
+
+        "errors":
+            errors,
+    }
 
 
-# =========================
+# ============================================================
+# DATAFRAME
+# ============================================================
+
+def dataframe_from_rows(
+    rows
+):
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        rows
+    )
+
+    columns = [
+
+        "id",
+        "titolo",
+        "citta",
+        "telefono",
+        "url",
+        "note",
+        "active",
+        "first_seen",
+        "last_seen",
+        "external_check_done",
+        "external_match_count",
+
+    ]
+
+    for col in columns:
+
+        if col not in df.columns:
+
+            df[col] = None
+
+    return df[
+        columns
+    ]
+
+
+# ============================================================
 # INTERFACCIA STREAMLIT
-# =========================
+# ============================================================
 
 st.set_page_config(
-    page_title="Scraper annunci Romagna",
+
+    page_title=(
+        "Archivio annunci Romagna"
+    ),
+
     page_icon="🔎",
+
     layout="wide",
+
 )
+
 
 st.title(
-    "🔎 Annunci Forlì, Rimini e Ravenna"
+    "🔎 Archivio annunci "
+    "Forlì, Rimini e Ravenna"
 )
+
 
 st.caption(
-    "Elenco degli annunci pubblicamente "
-    "visibili trovati nelle tre città."
+    "Gli annunci vengono salvati "
+    "nel database Supabase. "
+    "Durante gli aggiornamenti le pagine "
+    "di dettaglio vengono aperte soltanto "
+    "per gli URL mai processati prima."
 )
 
+
+# ============================================================
+# CONTROLLO SECRETS
+# ============================================================
+
+missing_secrets = [
+
+    name
+
+    for name in (
+        "SUPABASE_URL",
+        "SUPABASE_KEY"
+    )
+
+    if name not in st.secrets
+
+]
+
+
+if missing_secrets:
+
+    st.error(
+        "Mancano i Secrets Streamlit: "
+        + ", ".join(
+            missing_secrets
+        )
+    )
+
+    st.stop()
+
+
+# ============================================================
+# PULSANTE AGGIORNAMENTO
+# ============================================================
 
 refresh = st.button(
-    "🔄 Aggiorna dati",
-    type="primary"
+
+    "🔄 Cerca nuovi annunci",
+
+    type="primary",
+
 )
 
-if refresh:
-    scrape_all_sources.clear()
 
+if refresh:
+
+    try:
+
+        with st.spinner(
+            "Controllo Forlì, Rimini e Ravenna "
+            "e salvo soltanto i nuovi annunci..."
+        ):
+
+            result = (
+                scrape_and_sync()
+            )
+
+        st.success(
+
+            f"Controllo completato. "
+
+            f"Nuovi: "
+            f"{result['new']} · "
+
+            f"Già conosciuti: "
+            f"{result['known']} · "
+
+            f"Attualmente trovati: "
+            f"{result['current']}"
+
+        )
+
+        if result["errors"]:
+
+            with st.expander(
+                f"Dettagli errori "
+                f"({len(result['errors'])})"
+            ):
+
+                for error in result[
+                    "errors"
+                ]:
+
+                    st.write(
+                        error
+                    )
+
+    except Exception as exc:
+
+        st.error(
+            "Errore durante "
+            "l'aggiornamento: "
+            f"{exc}"
+        )
+
+
+# ============================================================
+# CARICAMENTO DATABASE
+# ============================================================
 
 try:
 
-    with st.spinner(
-        "Sto leggendo gli annunci "
-        "e cercando i numeri di telefono..."
-    ):
-
-        records = scrape_all_sources()
-
-
-except requests.HTTPError as exc:
-
-    st.error(
-        f"Errore HTTP: {exc}"
-    )
-
-    st.stop()
-
-
-except requests.RequestException as exc:
-
-    st.error(
-        f"Errore di connessione: {exc}"
-    )
-
-    st.stop()
-
+    rows = load_all_ads()
 
 except Exception as exc:
 
     st.error(
-        f"Errore inatteso: {exc}"
+        "Impossibile leggere "
+        "il database Supabase. "
+        f"Dettaglio: {exc}"
     )
 
     st.stop()
 
 
-if not records:
+df = dataframe_from_rows(
+    rows
+)
 
-    st.warning(
-        "Non è stato trovato "
-        "alcun annuncio."
+
+# ============================================================
+# DATABASE VUOTO
+# ============================================================
+
+if df.empty:
+
+    st.info(
+        "Il database è ancora vuoto. "
+        "Premi “Cerca nuovi annunci” "
+        "per effettuare il primo caricamento."
     )
 
     st.stop()
 
 
-df = pd.DataFrame(records)
+# ============================================================
+# ANNUNCI ATTIVI
+# ============================================================
+
+active_df = df[
+    df["active"] == True
+].copy()
 
 
-# =========================
-# CONTATORI
-# =========================
+# ============================================================
+# RIEPILOGO
+# ============================================================
 
-city_counts = (
-    df.groupby("Città")
-    .size()
-    .to_dict()
+c1, c2, c3, c4 = st.columns(
+    4
 )
 
 
-st.write(
-    f"**{len(df)} annunci trovati**"
-)
-
-st.write(
-    f"Forlì: "
-    f"**{city_counts.get('Forlì', 0)}**"
-    f" — Rimini: "
-    f"**{city_counts.get('Rimini', 0)}**"
-    f" — Ravenna: "
-    f"**{city_counts.get('Ravenna', 0)}**"
+c1.metric(
+    "Totale archivio",
+    len(df)
 )
 
 
-# =========================
-# TABELLA
-# =========================
+c2.metric(
+    "Attivi",
+    len(active_df)
+)
 
-display_df = df[
+
+c3.metric(
+    "Forlì",
+    int(
+        (
+            active_df["citta"]
+            == "Forlì"
+        ).sum()
+    )
+)
+
+
+c4.metric(
+    "Rimini + Ravenna",
+    int(
+        active_df[
+            "citta"
+        ]
+        .isin(
+            [
+                "Rimini",
+                "Ravenna"
+            ]
+        )
+        .sum()
+    )
+)
+
+
+# ============================================================
+# MOSTRA INATTIVI
+# ============================================================
+
+show_inactive = st.checkbox(
+
+    "Mostra anche annunci "
+    "non più presenti nelle "
+    "pagine correnti",
+
+    value=False,
+
+)
+
+
+if show_inactive:
+
+    view_df = df.copy()
+
+else:
+
+    view_df = (
+        active_df.copy()
+    )
+
+
+# ============================================================
+# ORDINAMENTO
+# ============================================================
+
+view_df = view_df.sort_values(
+
+    by=[
+        "last_seen",
+        "first_seen"
+    ],
+
+    ascending=[
+        False,
+        False
+    ],
+
+    na_position="last",
+
+)
+
+
+# ============================================================
+# TABELLA MODIFICABILE
+# ============================================================
+
+st.subheader(
+    "Annunci"
+)
+
+
+editor_df = view_df[
     [
-        "Annuncio",
-        "Città",
-        "Telefono",
-        "Link"
+        "id",
+        "titolo",
+        "citta",
+        "telefono",
+        "url",
+        "note",
+        "active",
     ]
 ].copy()
 
 
-st.dataframe(
-    display_df,
+edited_df = st.data_editor(
+
+    editor_df,
+
     use_container_width=True,
+
     hide_index=True,
+
+    key="ads_editor",
+
+    # Tutto bloccato tranne Note
+    disabled=[
+        "id",
+        "titolo",
+        "citta",
+        "telefono",
+        "url",
+        "active",
+    ],
 
     column_config={
 
-        "Annuncio":
+        "id":
+            None,
+
+        "titolo":
             st.column_config.TextColumn(
                 "Nome annuncio",
-                width="large"
+                width="large",
             ),
 
-        "Città":
+        "citta":
             st.column_config.TextColumn(
                 "Città",
-                width="small"
+                width="small",
             ),
 
-        "Telefono":
+        "telefono":
             st.column_config.TextColumn(
                 "Telefono",
-                width="medium"
+                width="medium",
             ),
 
-        "Link":
+        "url":
             st.column_config.LinkColumn(
                 "Annuncio",
                 display_text="Apri",
-                width="small"
+                width="small",
             ),
+
+        "note":
+            st.column_config.TextColumn(
+                "Note",
+                help=(
+                    "Campo modificabile "
+                    "manualmente"
+                ),
+                width="large",
+            ),
+
+        "active":
+            st.column_config.CheckboxColumn(
+                "Attivo",
+                width="small",
+            ),
+
     },
+
 )
 
 
-# =========================
+# ============================================================
+# SALVATAGGIO NOTE
+# ============================================================
+
+if st.button(
+    "💾 Salva note"
+):
+
+    original_notes = {
+
+        int(row["id"]):
+            (
+                row.get("note")
+                or ""
+            )
+
+        for _, row
+        in editor_df.iterrows()
+
+    }
+
+
+    changed = 0
+
+    errors = []
+
+
+    with st.spinner(
+        "Salvataggio note..."
+    ):
+
+        for _, row in (
+            edited_df.iterrows()
+        ):
+
+            row_id = int(
+                row["id"]
+            )
+
+            new_note = (
+                row.get("note")
+                or ""
+            )
+
+            old_note = (
+                original_notes.get(
+                    row_id,
+                    ""
+                )
+            )
+
+            if new_note != old_note:
+
+                try:
+
+                    save_note(
+                        row_id,
+                        new_note
+                    )
+
+                    changed += 1
+
+                except Exception as exc:
+
+                    errors.append(
+                        f"ID {row_id}: "
+                        f"{exc}"
+                    )
+
+
+    if errors:
+
+        st.error(
+            f"Salvate {changed} note, "
+            f"ma si sono verificati "
+            f"{len(errors)} errori."
+        )
+
+        with st.expander(
+            "Dettagli errori"
+        ):
+
+            for error in errors:
+
+                st.write(
+                    error
+                )
+
+    else:
+
+        st.success(
+            f"Note salvate: "
+            f"{changed}"
+        )
+
+
+# ============================================================
 # DOWNLOAD CSV
-# =========================
+# ============================================================
+
+export_df = view_df[
+    [
+        "titolo",
+        "citta",
+        "telefono",
+        "url",
+        "note",
+        "active",
+        "first_seen",
+        "last_seen",
+    ]
+].copy()
+
 
 csv_data = (
-    df.to_csv(
+
+    export_df
+    .to_csv(
         index=False
     )
-    .encode("utf-8-sig")
+    .encode(
+        "utf-8-sig"
+    )
+
 )
 
 
 st.download_button(
-    "📥 Scarica elenco CSV",
+
+    "📥 Scarica CSV",
+
     data=csv_data,
+
     file_name=(
-        "annunci_forli_"
-        "rimini_ravenna.csv"
+        "archivio_annunci_romagna.csv"
     ),
+
     mime="text/csv",
+
 )
