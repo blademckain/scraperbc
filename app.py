@@ -31,12 +31,14 @@ MAX_PAGES_PER_CITY = 10
 LISTING_PAGE_DELAY = 0.20
 DETAIL_PAGE_DELAY = 0.25
 
+# Supabase restituisce normalmente max 1000 righe per pagina
+SUPABASE_PAGE_SIZE = 1000
+
 # ============================================================
 # SERPER
 # ============================================================
 
 SERPER_MAX_PER_CLICK = 5
-
 SERPER_DELAY = 2.0
 SERPER_MAX_RETRIES = 4
 SERPER_BACKOFF_BASE = 3
@@ -186,6 +188,10 @@ def extract_phone_from_detail(html):
 
     candidates = []
 
+    # --------------------------------------------------------
+    # href="tel:"
+    # --------------------------------------------------------
+
     for a in soup.select(
         'a[href^="tel:"]'
     ):
@@ -195,6 +201,10 @@ def extract_phone_from_detail(html):
                 ""
             )
         )
+
+    # --------------------------------------------------------
+    # Attributi HTML
+    # --------------------------------------------------------
 
     phone_attrs = (
         "data-phone",
@@ -222,6 +232,10 @@ def extract_phone_from_detail(html):
                     )
                 )
 
+    # --------------------------------------------------------
+    # Titolo
+    # --------------------------------------------------------
+
     if soup.title:
         candidates.append(
             soup.title.get_text(
@@ -229,6 +243,10 @@ def extract_phone_from_detail(html):
                 strip=True
             )
         )
+
+    # --------------------------------------------------------
+    # Meta
+    # --------------------------------------------------------
 
     for meta in soup.find_all(
         "meta"
@@ -241,6 +259,10 @@ def extract_phone_from_detail(html):
             candidates.append(
                 content
             )
+
+    # --------------------------------------------------------
+    # Script / JSON
+    # --------------------------------------------------------
 
     for script in soup.find_all(
         "script"
@@ -257,6 +279,10 @@ def extract_phone_from_detail(html):
             candidates.append(
                 text
             )
+
+    # --------------------------------------------------------
+    # Testo visibile
+    # --------------------------------------------------------
 
     candidates.append(
         soup.get_text(
@@ -277,10 +303,8 @@ def extract_phone_from_detail(html):
         if not candidate:
             continue
 
-        match = (
-            mobile_pattern.search(
-                candidate
-            )
+        match = mobile_pattern.search(
+            candidate
         )
 
         if match:
@@ -362,6 +386,7 @@ def extract_listing_links(
         "a",
         href=True
     ):
+
         href = a.get(
             "href"
         )
@@ -415,7 +440,6 @@ def extract_listing_links(
             )
 
             if heading:
-
                 title = clean_text(
                     heading.get_text(
                         " ",
@@ -534,9 +558,9 @@ def serper_domain_matches(
                 timeout=REQUEST_TIMEOUT,
             )
 
-            # =================================================
+            # ------------------------------------------------
             # 429
-            # =================================================
+            # ------------------------------------------------
 
             if response.status_code == 429:
 
@@ -549,13 +573,11 @@ def serper_domain_matches(
                 if retry_after:
 
                     try:
-
                         wait_seconds = float(
                             retry_after
                         )
 
                     except ValueError:
-
                         wait_seconds = (
                             SERPER_BACKOFF_BASE
                             * (
@@ -599,9 +621,9 @@ def serper_domain_matches(
 
                 continue
 
-            # =================================================
-            # ERRORI SERVER TEMPORANEI
-            # =================================================
+            # ------------------------------------------------
+            # Errori temporanei server
+            # ------------------------------------------------
 
             if response.status_code in (
                 500,
@@ -678,9 +700,7 @@ def serper_domain_matches(
                 ).lower()
 
                 if (
-                    hostname
-                    == target_domain
-
+                    hostname == target_domain
                     or hostname.endswith(
                         "."
                         + target_domain
@@ -740,10 +760,8 @@ def serper_domain_matches(
                 continue
 
     raise RuntimeError(
-        "Serper non disponibile "
-        f"dopo "
-        f"{SERPER_MAX_RETRIES} "
-        f"tentativi. "
+        "Serper non disponibile dopo "
+        f"{SERPER_MAX_RETRIES} tentativi. "
         f"Ultimo errore: "
         f"{last_error}"
     )
@@ -768,49 +786,109 @@ def get_supabase():
 
 
 # ============================================================
+# LETTURA SUPABASE PAGINATA
+# ============================================================
+
+def fetch_all_rows(
+    table_name,
+    columns="*",
+    order_by=None,
+    desc=False,
+    page_size=SUPABASE_PAGE_SIZE,
+):
+    """
+    Legge TUTTE le righe di una tabella Supabase
+    usando range() a blocchi da 1000.
+
+    Risolve il problema del limite standard
+    delle prime 1000 righe.
+    """
+
+    db = get_supabase()
+
+    all_rows = []
+
+    start = 0
+
+    while True:
+
+        end = (
+            start
+            + page_size
+            - 1
+        )
+
+        query = (
+            db
+            .table(
+                table_name
+            )
+            .select(
+                columns
+            )
+        )
+
+        if order_by:
+
+            query = query.order(
+                order_by,
+                desc=desc
+            )
+
+        response = (
+            query
+            .range(
+                start,
+                end
+            )
+            .execute()
+        )
+
+        rows = (
+            response.data
+            or []
+        )
+
+        all_rows.extend(
+            rows
+        )
+
+        if len(rows) < page_size:
+            break
+
+        start += page_size
+
+    return all_rows
+
+
+# ============================================================
 # ANNUNCI DB
 # ============================================================
 
 def load_all_ads():
 
-    response = (
-        get_supabase()
-        .table(
-            ADS_TABLE
-        )
-        .select("*")
-        .order(
-            "first_seen",
-            desc=True
-        )
-        .execute()
-    )
-
-    return (
-        response.data
-        or []
+    return fetch_all_rows(
+        table_name=ADS_TABLE,
+        columns="*",
+        order_by="first_seen",
+        desc=True,
     )
 
 
 def load_known_ads():
 
-    response = (
-        get_supabase()
-        .table(
-            ADS_TABLE
-        )
-        .select(
-            "url,telefono,phone_hash"
-        )
-        .execute()
+    rows = fetch_all_rows(
+        table_name=ADS_TABLE,
+        columns=(
+            "url,"
+            "telefono,"
+            "phone_hash"
+        ),
     )
 
     result = {}
 
-    for row in (
-        response.data
-        or []
-    ):
+    for row in rows:
 
         url = row.get(
             "url"
@@ -879,12 +957,46 @@ def update_last_seen(
     )
 
 
+def update_ad_phone(
+    url,
+    phone,
+    phone_hash
+):
+    """
+    Ripara un annuncio già salvato
+    che in precedenza non aveva telefono/hash.
+    """
+
+    (
+        get_supabase()
+        .table(
+            ADS_TABLE
+        )
+        .update(
+            {
+                "telefono":
+                    phone,
+
+                "phone_hash":
+                    phone_hash,
+            }
+        )
+        .eq(
+            "url",
+            url
+        )
+        .execute()
+    )
+
+
 def mark_missing_as_inactive(
     current_urls
 ):
 
     db = get_supabase()
 
+    # Ora legge TUTTO il database,
+    # non soltanto le prime 1000 righe.
     for row in load_all_ads():
 
         url = row.get(
@@ -925,13 +1037,9 @@ def mark_missing_as_inactive(
 
 def load_phone_registry():
 
-    response = (
-        get_supabase()
-        .table(
-            PHONE_TABLE
-        )
-        .select("*")
-        .execute()
+    rows = fetch_all_rows(
+        table_name=PHONE_TABLE,
+        columns="*",
     )
 
     return {
@@ -941,10 +1049,7 @@ def load_phone_registry():
         ]:
             row
 
-        for row in (
-            response.data
-            or []
-        )
+        for row in rows
 
         if row.get(
             "phone_hash"
@@ -1132,7 +1237,7 @@ def save_external_check(
 
 
 # ============================================================
-# PAGINAZIONE
+# PAGINAZIONE SITO
 # ============================================================
 
 def build_listing_page_url(
@@ -1161,6 +1266,7 @@ def scrape_and_sync():
         HEADERS
     )
 
+    # Queste funzioni ora leggono TUTTE le righe
     known_ads = (
         load_known_ads()
     )
@@ -1176,6 +1282,10 @@ def scrape_and_sync():
     new_phones = 0
     duplicate_phones = 0
 
+    # Annunci vecchi che erano senza telefono/hash
+    recovered_phones = 0
+    recovery_failed = 0
+
     pages_loaded = 0
     pages_failed = 0
 
@@ -1190,6 +1300,10 @@ def scrape_and_sync():
 
         city_listings = []
         seen_city_urls = set()
+
+        # ====================================================
+        # PRIME 10 PAGINE
+        # ====================================================
 
         for page_number in range(
             1,
@@ -1231,6 +1345,7 @@ def scrape_and_sync():
 
                 continue
 
+            # Deduplica all'interno della città
             for item in page_listings:
 
                 if (
@@ -1251,6 +1366,10 @@ def scrape_and_sync():
                 LISTING_PAGE_DELAY
             )
 
+        # ====================================================
+        # PROCESSA ANNUNCI
+        # ====================================================
+
         for item in city_listings:
 
             url = item[
@@ -1260,6 +1379,10 @@ def scrape_and_sync():
             current_urls.add(
                 url
             )
+
+            # =================================================
+            # URL GIÀ PRESENTE NEL DATABASE
+            # =================================================
 
             if url in known_ads:
 
@@ -1272,23 +1395,6 @@ def scrape_and_sync():
                         now
                     )
 
-                    phone_hash = (
-                        known_ads[
-                            url
-                        ]
-                        .get(
-                            "phone_hash",
-                            ""
-                        )
-                    )
-
-                    if phone_hash:
-
-                        update_phone_last_seen(
-                            phone_hash,
-                            now
-                        )
-
                 except Exception as exc:
 
                     errors.append(
@@ -1296,7 +1402,186 @@ def scrape_and_sync():
                         f"{url}: {exc}"
                     )
 
+                existing_phone = (
+                    normalize_phone(
+                        known_ads[
+                            url
+                        ].get(
+                            "telefono",
+                            ""
+                        )
+                    )
+                )
+
+                existing_hash = (
+                    known_ads[
+                        url
+                    ].get(
+                        "phone_hash",
+                        ""
+                    )
+                    or ""
+                )
+
+                # ---------------------------------------------
+                # Record completo: non riapriamo il dettaglio
+                # ---------------------------------------------
+
+                if (
+                    existing_phone
+                    and existing_hash
+                ):
+
+                    try:
+
+                        update_phone_last_seen(
+                            existing_hash,
+                            now
+                        )
+
+                    except Exception as exc:
+
+                        errors.append(
+                            "Aggiornamento telefono "
+                            f"{existing_hash[:8]}: "
+                            f"{exc}"
+                        )
+
+                    continue
+
+                # ---------------------------------------------
+                # BUG FIX:
+                # URL conosciuto ma manca telefono / hash.
+                #
+                # Riapriamo il dettaglio e tentiamo
+                # di riparare il record.
+                # ---------------------------------------------
+
+                try:
+
+                    detail_html = get_page(
+                        session,
+                        url
+                    )
+
+                    recovered_phone = (
+                        extract_phone_from_detail(
+                            detail_html
+                        )
+                    )
+
+                    recovered_hash = (
+                        make_phone_hash(
+                            recovered_phone
+                        )
+                    )
+
+                    if (
+                        recovered_phone
+                        and recovered_hash
+                    ):
+
+                        # Aggiorna annuncio esistente
+                        update_ad_phone(
+                            url=url,
+                            phone=recovered_phone,
+                            phone_hash=recovered_hash,
+                        )
+
+                        # Registra telefono se non esiste
+                        if (
+                            recovered_hash
+                            not in phone_registry
+                        ):
+
+                            insert_phone_registry(
+                                recovered_hash,
+                                now
+                            )
+
+                            phone_registry[
+                                recovered_hash
+                            ] = {
+
+                                "phone_hash":
+                                    recovered_hash,
+
+                                "first_seen":
+                                    now,
+
+                                "last_seen":
+                                    now,
+
+                                "processed":
+                                    False,
+
+                                "target_domain":
+                                    None,
+
+                                "match_count":
+                                    0,
+
+                                "match_urls":
+                                    [],
+
+                                "processed_at":
+                                    None,
+
+                                "note":
+                                    "",
+
+                                "hidden":
+                                    False,
+
+                                "hidden_at":
+                                    None,
+                            }
+
+                            new_phones += 1
+
+                        else:
+
+                            update_phone_last_seen(
+                                recovered_hash,
+                                now
+                            )
+
+                        # Aggiorna anche la memoria locale
+                        known_ads[
+                            url
+                        ] = {
+
+                            "telefono":
+                                recovered_phone,
+
+                            "phone_hash":
+                                recovered_hash,
+                        }
+
+                        recovered_phones += 1
+
+                    else:
+
+                        recovery_failed += 1
+
+                except Exception as exc:
+
+                    recovery_failed += 1
+
+                    errors.append(
+                        "Recupero telefono "
+                        f"{url}: {exc}"
+                    )
+
+                time.sleep(
+                    DETAIL_PAGE_DELAY
+                )
+
                 continue
+
+            # =================================================
+            # NUOVO URL
+            # =================================================
 
             phone = ""
             phone_hash = ""
@@ -1326,6 +1611,10 @@ def scrape_and_sync():
                     f"Dettaglio "
                     f"{url}: {exc}"
                 )
+
+            # =================================================
+            # REGISTRO TELEFONO
+            # =================================================
 
             if phone_hash:
 
@@ -1406,6 +1695,10 @@ def scrape_and_sync():
                             f"{exc}"
                         )
 
+            # =================================================
+            # SALVA NUOVO ANNUNCIO
+            # =================================================
+
             row = {
 
                 "url":
@@ -1476,6 +1769,10 @@ def scrape_and_sync():
                 DETAIL_PAGE_DELAY
             )
 
+    # ========================================================
+    # INATTIVI
+    # ========================================================
+
     expected_pages = (
         len(SOURCES)
         * MAX_PAGES_PER_CITY
@@ -1501,6 +1798,14 @@ def scrape_and_sync():
                 f"{exc}"
             )
 
+    elif pages_failed > 0:
+
+        errors.append(
+            "Almeno una pagina elenco non è "
+            "stata caricata. Gli annunci mancanti "
+            "non sono stati marcati come inattivi."
+        )
+
     return {
 
         "new_ads":
@@ -1515,6 +1820,12 @@ def scrape_and_sync():
         "duplicate_phones":
             duplicate_phones,
 
+        "recovered_phones":
+            recovered_phones,
+
+        "recovery_failed":
+            recovery_failed,
+
         "pages_loaded":
             pages_loaded,
 
@@ -1527,6 +1838,54 @@ def scrape_and_sync():
 
 
 # ============================================================
+# TELEFONO DA PROCESSARE?
+# ============================================================
+
+def needs_match_check(
+    registry_row,
+    target_domain
+):
+
+    if not registry_row:
+        return True
+
+    if registry_row.get(
+        "hidden",
+        False
+    ):
+        return False
+
+    processed = bool(
+        registry_row.get(
+            "processed",
+            False
+        )
+    )
+
+    stored_domain = clean_domain(
+        registry_row.get(
+            "target_domain",
+            ""
+        )
+    )
+
+    current_domain = clean_domain(
+        target_domain
+    )
+
+    if not processed:
+        return True
+
+    if (
+        stored_domain
+        != current_domain
+    ):
+        return True
+
+    return False
+
+
+# ============================================================
 # CALCOLA MATCH - MAX 5 PER CLICK
 # ============================================================
 
@@ -1535,6 +1894,7 @@ def calculate_pending_matches(
     log_callback
 ):
 
+    # Ora entrambe leggono TUTTO il DB
     known_ads = (
         load_known_ads()
     )
@@ -1545,6 +1905,10 @@ def calculate_pending_matches(
 
     phones_by_hash = {}
 
+    # ========================================================
+    # COSTRUISCE phone_hash -> telefono
+    # ========================================================
+
     for ad in known_ads.values():
 
         phone = normalize_phone(
@@ -1554,9 +1918,12 @@ def calculate_pending_matches(
             )
         )
 
-        phone_hash = ad.get(
-            "phone_hash",
-            ""
+        phone_hash = (
+            ad.get(
+                "phone_hash",
+                ""
+            )
+            or ""
         )
 
         if (
@@ -1570,6 +1937,10 @@ def calculate_pending_matches(
                 phone_hash
             ] = phone
 
+    # ========================================================
+    # TROVA TUTTI I PENDING
+    # ========================================================
+
     pending = []
 
     for (
@@ -1582,32 +1953,9 @@ def calculate_pending_matches(
             {}
         )
 
-        if row.get(
-            "hidden",
-            False
-        ):
-            continue
-
-        processed = bool(
-            row.get(
-                "processed",
-                False
-            )
-        )
-
-        stored_domain = clean_domain(
-            row.get(
-                "target_domain",
-                ""
-            )
-        )
-
-        if (
-            not processed
-            or stored_domain
-            != clean_domain(
-                target_domain
-            )
+        if needs_match_check(
+            row,
+            target_domain
         ):
 
             pending.append(
@@ -1621,12 +1969,27 @@ def calculate_pending_matches(
         pending
     )
 
+    # Solo 5 per click
     batch = pending[
         :SERPER_MAX_PER_CLICK
     ]
 
     success_count = 0
     error_count = 0
+
+    # ========================================================
+    # LOG INIZIALE
+    # ========================================================
+
+    log_callback(
+        f"{now_label()} - "
+        f"Telefoni da processare trovati: "
+        f"{total_pending}"
+    )
+
+    # ========================================================
+    # PROCESSA BATCH
+    # ========================================================
 
     for (
         index,
@@ -1681,6 +2044,9 @@ def calculate_pending_matches(
 
             error_count += 1
 
+            # IMPORTANTE:
+            # non viene chiamato save_external_check()
+            # quindi processed resta FALSE
             log_callback(
                 f"{now_label()} - "
                 f"ERRORE "
@@ -1692,12 +2058,17 @@ def calculate_pending_matches(
             SERPER_DELAY
         )
 
+    remaining_estimate = (
+        total_pending
+        - success_count
+    )
+
     return {
 
         "pending_before":
             total_pending,
 
-        "processed_this_click":
+        "attempted":
             len(batch),
 
         "success":
@@ -1706,11 +2077,10 @@ def calculate_pending_matches(
         "errors":
             error_count,
 
-        "remaining_estimate":
+        "remaining":
             max(
                 0,
-                total_pending
-                - success_count
+                remaining_estimate
             ),
     }
 
@@ -1752,12 +2122,14 @@ def build_grouped_view(
             "active"
         ] = True
 
+    # Solo annunci attivi
     df = df[
         df[
             "active"
         ] == True
     ].copy()
 
+    # Solo annunci con hash
     df = df[
         df[
             "phone_hash"
@@ -1845,15 +2217,12 @@ def build_grouped_view(
             match_urls,
             list
         ):
-
             match_urls = []
 
         groups.append(
             {
                 "telefono_id":
-                    phone_hash[
-                        :8
-                    ],
+                    phone_hash[:8],
 
                 "phone_hash":
                     phone_hash,
@@ -1911,9 +2280,11 @@ def build_grouped_view(
             x[
                 "match_count"
             ],
+
             x[
                 "numero_annunci"
             ],
+
             str(
                 x[
                     "first_seen"
@@ -1940,12 +2311,17 @@ st.set_page_config(
 )
 
 
+# ============================================================
+# CSS
+# ============================================================
+
 st.markdown(
     """
     <style>
 
     .block-container {
         padding-top: 1.5rem;
+        padding-bottom: 2rem;
     }
 
     div[data-testid="stVerticalBlockBorderWrapper"] {
@@ -1953,8 +2329,12 @@ st.markdown(
             128,
             128,
             128,
-            0.45
+            0.50
         );
+    }
+
+    div[data-testid="stButton"] button {
+        min-height: 2.4rem;
     }
 
     </style>
@@ -2014,6 +2394,26 @@ TARGET_DOMAIN = clean_domain(
 )
 
 
+if not TARGET_DOMAIN:
+
+    st.error(
+        "TARGET_DOMAIN non valido."
+    )
+
+    st.stop()
+
+
+st.caption(
+    f"Scraping: prime "
+    f"{MAX_PAGES_PER_CITY} pagine "
+    f"per ciascuna città. "
+    f"Supabase: lettura paginata completa. "
+    f"Match: max "
+    f"{SERPER_MAX_PER_CLICK} "
+    f"query per click."
+)
+
+
 # ============================================================
 # PULSANTI PRINCIPALI
 # ============================================================
@@ -2023,56 +2423,74 @@ button_col1, button_col2 = (
 )
 
 
+# ============================================================
+# SCRAPING
+# ============================================================
+
 with button_col1:
 
-    if st.button(
+    scrape_button = st.button(
         "🔄 Cerca nuovi annunci",
         type="primary",
         use_container_width=True
-    ):
+    )
 
-        try:
 
-            with st.spinner(
-                "Scraping in corso..."
+if scrape_button:
+
+    try:
+
+        with st.spinner(
+            "Scraping in corso. "
+            "Controllo anche gli annunci "
+            "già salvati che non hanno "
+            "telefono/hash..."
+        ):
+
+            result = (
+                scrape_and_sync()
+            )
+
+        st.success(
+            f"Pagine lette: "
+            f"{result['pages_loaded']}/"
+            f"{len(SOURCES) * MAX_PAGES_PER_CITY} · "
+            f"Nuovi annunci: "
+            f"{result['new_ads']} · "
+            f"Già conosciuti: "
+            f"{result['known_ads']} · "
+            f"Nuovi telefoni: "
+            f"{result['new_phones']} · "
+            f"Telefoni recuperati: "
+            f"{result['recovered_phones']} · "
+            f"Recovery senza risultato: "
+            f"{result['recovery_failed']}"
+        )
+
+        if result[
+            "errors"
+        ]:
+
+            with st.expander(
+                f"Avvisi / errori "
+                f"({len(result['errors'])})"
             ):
 
-                result = (
-                    scrape_and_sync()
-                )
-
-            st.success(
-                f"Pagine lette: "
-                f"{result['pages_loaded']}/30 · "
-                f"Nuovi annunci: "
-                f"{result['new_ads']} · "
-                f"Nuovi telefoni: "
-                f"{result['new_phones']}"
-            )
-
-            if result[
-                "errors"
-            ]:
-
-                with st.expander(
-                    "Avvisi"
+                for error in (
+                    result[
+                        "errors"
+                    ]
                 ):
 
-                    for error in (
-                        result[
-                            "errors"
-                        ]
-                    ):
+                    st.write(
+                        error
+                    )
 
-                        st.write(
-                            error
-                        )
+    except Exception as exc:
 
-        except Exception as exc:
-
-            st.error(
-                f"Errore: {exc}"
-            )
+        st.error(
+            f"Errore scraping: {exc}"
+        )
 
 
 # ============================================================
@@ -2116,14 +2534,16 @@ if calculate_match:
         )
 
         st.success(
-            f"Processati: "
-            f"{result['processed_this_click']} · "
+            f"Da processare all'inizio: "
+            f"{result['pending_before']} · "
+            f"Tentati: "
+            f"{result['attempted']} · "
             f"Completati: "
             f"{result['success']} · "
             f"Errori: "
             f"{result['errors']} · "
             f"Ancora da processare: "
-            f"{result['remaining_estimate']}"
+            f"{result['remaining']}"
         )
 
     except Exception as exc:
@@ -2134,7 +2554,7 @@ if calculate_match:
 
 
 # ============================================================
-# DATI
+# CARICAMENTO DATI COMPLETO E PAGINATO
 # ============================================================
 
 try:
@@ -2143,15 +2563,12 @@ try:
         load_all_ads()
     )
 
-    registry_rows = (
-        get_supabase()
-        .table(
-            PHONE_TABLE
-        )
-        .select("*")
-        .execute()
-        .data
-        or []
+    phone_registry_dict = (
+        load_phone_registry()
+    )
+
+    registry_rows = list(
+        phone_registry_dict.values()
     )
 
 except Exception as exc:
@@ -2162,6 +2579,10 @@ except Exception as exc:
 
     st.stop()
 
+
+# ============================================================
+# MOSTRA NASCOSTI
+# ============================================================
 
 show_hidden = (
     st.checkbox(
@@ -2193,8 +2614,8 @@ if not groups:
 # METRICHE
 # ============================================================
 
-m1, m2, m3, m4 = (
-    st.columns(4)
+m1, m2, m3, m4, m5 = (
+    st.columns(5)
 )
 
 
@@ -2210,8 +2631,10 @@ m2.metric(
     "Con match",
     sum(
         1
-        for g in groups
-        if g[
+
+        for group in groups
+
+        if group[
             "match_count"
         ] > 0
     )
@@ -2221,29 +2644,28 @@ m2.metric(
 m3.metric(
     "Match totali",
     sum(
-        g[
+        group[
             "match_count"
         ]
-        for g in groups
+
+        for group in groups
     )
 )
 
 
+# ============================================================
+# PENDING CORRETTO
+# ============================================================
+
 pending_count = sum(
+
     1
 
     for row in registry_rows
 
-    if (
-        not row.get(
-            "processed",
-            False
-        )
-
-        and not row.get(
-            "hidden",
-            False
-        )
+    if needs_match_check(
+        row,
+        TARGET_DOMAIN
     )
 )
 
@@ -2251,6 +2673,27 @@ pending_count = sum(
 m4.metric(
     "Da verificare",
     pending_count
+)
+
+
+missing_hash_count = sum(
+
+    1
+
+    for row in ads_rows
+
+    if not (
+        row.get(
+            "phone_hash"
+        )
+        or ""
+    )
+)
+
+
+m5.metric(
+    "Annunci senza hash",
+    missing_hash_count
 )
 
 
@@ -2282,15 +2725,23 @@ headers = [
 ]
 
 
+# ============================================================
+# HEADER
+# ============================================================
+
 with st.container(
     border=True
 ):
 
     cols = st.columns(
-        COLUMN_WIDTHS
+        COLUMN_WIDTHS,
+        gap="small"
     )
 
-    for col, label in zip(
+    for (
+        col,
+        label
+    ) in zip(
         cols,
         headers
     ):
@@ -2306,6 +2757,10 @@ with st.container(
                 )
 
 
+# ============================================================
+# RIGHE
+# ============================================================
+
 for group in groups:
 
     phone_hash = (
@@ -2319,7 +2774,8 @@ for group in groups:
     ):
 
         cols = st.columns(
-            COLUMN_WIDTHS
+            COLUMN_WIDTHS,
+            gap="small"
         )
 
         # ====================================================
@@ -2392,7 +2848,10 @@ for group in groups:
                 border=True
             ):
 
-                for index, ad in enumerate(
+                for (
+                    index,
+                    ad
+                ) in enumerate(
                     group[
                         "annunci"
                     ],
@@ -2448,7 +2907,10 @@ for group in groups:
                     "match_urls"
                 ]:
 
-                    for index, link in enumerate(
+                    for (
+                        index,
+                        link
+                    ) in enumerate(
                         group[
                             "match_urls"
                         ],
@@ -2510,15 +2972,24 @@ for group in groups:
                     use_container_width=True
                 ):
 
-                    save_phone_note(
-                        phone_hash,
-                        note_value
-                    )
+                    try:
 
-                    st.rerun()
+                        save_phone_note(
+                            phone_hash,
+                            note_value
+                        )
+
+                        st.rerun()
+
+                    except Exception as exc:
+
+                        st.error(
+                            f"Errore nota: "
+                            f"{exc}"
+                        )
 
         # ====================================================
-        # NASCONDI
+        # NASCONDI / RIPRISTINA
         # ====================================================
 
         with cols[7]:
@@ -2540,12 +3011,21 @@ for group in groups:
                         use_container_width=True
                     ):
 
-                        set_phone_hidden(
-                            phone_hash,
-                            False
-                        )
+                        try:
 
-                        st.rerun()
+                            set_phone_hidden(
+                                phone_hash,
+                                False
+                            )
+
+                            st.rerun()
+
+                        except Exception as exc:
+
+                            st.error(
+                                f"Errore: "
+                                f"{exc}"
+                            )
 
                 else:
 
@@ -2558,9 +3038,111 @@ for group in groups:
                         use_container_width=True
                     ):
 
-                        set_phone_hidden(
-                            phone_hash,
-                            True
-                        )
+                        try:
 
-                        st.rerun()
+                            set_phone_hidden(
+                                phone_hash,
+                                True
+                            )
+
+                            st.rerun()
+
+                        except Exception as exc:
+
+                            st.error(
+                                f"Errore: "
+                                f"{exc}"
+                            )
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+csv_rows = []
+
+
+for group in groups:
+
+    csv_rows.append(
+        {
+            "telefono_id":
+                group[
+                    "telefono_id"
+                ],
+
+            "first_seen":
+                group[
+                    "first_seen"
+                ],
+
+            "citta":
+                group[
+                    "citta"
+                ],
+
+            "numero_annunci":
+                group[
+                    "numero_annunci"
+                ],
+
+            "match_count":
+                group[
+                    "match_count"
+                ],
+
+            "note":
+                group[
+                    "note"
+                ],
+
+            "hidden":
+                group[
+                    "hidden"
+                ],
+
+            "annunci":
+                " | ".join(
+                    (
+                        f"{ad['titolo']} "
+                        f"({ad['url']})"
+                    )
+
+                    for ad in (
+                        group[
+                            "annunci"
+                        ]
+                    )
+                ),
+
+            "match_urls":
+                " | ".join(
+                    group[
+                        "match_urls"
+                    ]
+                ),
+        }
+    )
+
+
+csv_data = (
+    pd.DataFrame(
+        csv_rows
+    )
+    .to_csv(
+        index=False
+    )
+    .encode(
+        "utf-8-sig"
+    )
+)
+
+
+st.download_button(
+    "📥 Scarica CSV",
+    data=csv_data,
+    file_name=(
+        "annunci_raggruppati.csv"
+    ),
+    mime="text/csv"
+)
