@@ -2592,13 +2592,30 @@ show_hidden = (
 )
 
 
-groups = (
-    build_grouped_view(
-        ads_rows,
-        registry_rows,
-        show_hidden
+groups = build_grouped_view(
+    ads_rows,
+    registry_rows,
+    show_hidden
+)
+
+show_without_matches = st.checkbox(
+    "🔎 Mostra anche risultati senza match",
+    value=False,
+    help=(
+        "Include i risultati con zero match "
+        "e quelli non ancora verificati."
     )
 )
+
+if not show_without_matches:
+    groups = [
+        group
+        for group in groups
+        if (
+            group["processed"]
+            and group["match_count"] > 0
+        )
+    ]
 
 
 if not groups:
