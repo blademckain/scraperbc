@@ -2621,7 +2621,9 @@ if not show_without_matches:
 if not groups:
 
     st.info(
-        "Nessun risultato."
+        "Nessun risultato con match da mostrare. "
+        "Attiva 'Mostra anche risultati senza match' "
+        "per visualizzare gli altri annunci."
     )
 
     st.stop()
