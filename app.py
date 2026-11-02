@@ -38,7 +38,7 @@ SUPABASE_PAGE_SIZE = 1000
 # SERPER
 # ============================================================
 
-SERPER_MAX_PER_CLICK = 5
+SERPER_MAX_PER_CLICK = 50
 SERPER_DELAY = 2.0
 SERPER_MAX_RETRIES = 4
 SERPER_BACKOFF_BASE = 3
